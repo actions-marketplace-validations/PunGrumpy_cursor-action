@@ -5,6 +5,7 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -34,6 +35,11 @@ jobs:
         run: bun install
       - name: Typecheck
         run: bun run typecheck
+      # Until now the formatter and the linter ran only in the pre-commit hook,
+      # so anyone whose install skipped husky could land unformatted code on a
+      # green build.
+      - name: Lint
+        run: bun run lint
       - name: Run tests
         run: bun run test
       - name: Build dist
@@ -42,52 +48,137 @@ jobs:
         run: |
           if [ -n "$(git status --porcelain dist/)" ]; then
             echo "::error::dist/ is out of date. Run 'bun run build' and commit the result."
-            git diff dist/
+            git diff --stat dist/
             exit 1
           fi
-      - name: Upload dist for smoke test
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
 
-  smoke-test:
-    name: Smoke Test
+  docs:
+    name: Docs
     runs-on: ubuntu-latest
-    needs:
-      - build
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    env:
-      CURSOR_SMOKE_TEST_MODEL: auto
     permissions:
       contents: read
-      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Download dist from build
-        uses: actions/download-artifact@v4
+      - uses: oven-sh/setup-bun@v2
+        name: Install Bun
+      - name: Install dependencies
+        run: |
+          bun install
+          bun install --cwd docs
+      # action.yml is the only place inputs and outputs are described. If this
+      # step changes a file, the documentation had drifted from the manifest.
+      - name: Verify the reference matches action.yml
+        run: |
+          bun run docs:reference
+          if [ -n "$(git status --porcelain README.md docs/content/reference.mdx)" ]; then
+            echo "::error::the generated reference is out of date. Run 'bun run docs:reference' and commit the result."
+            git diff -- README.md docs/content/reference.mdx
+            exit 1
+          fi
+      # The site has its own tsconfig and its own dependency tree, so the root
+      # typecheck never sees it and `waku build` does not typecheck either.
+      - name: Typecheck the documentation site
+        run: bun run docs:typecheck
+      # Fails on broken internal links, which is the cheapest signal that a page
+      # still describes something that no longer exists.
+      - name: Build the documentation site
+        run: bun run docs:build
+
+  # Proves the distribution path without spending an agent run: `npm ci` is the
+  # same install the composite action performs, and a rejected key still means
+  # the externals resolved, the SDK loaded its own lazy chunks, and the request
+  # reached Cursor. Both distribution bugs this test was written for died well
+  # before authentication, so an auth error is a pass.
+  integration:
+    name: Integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
-          name: dist
-          path: dist
-      - name: Prepare smoke workspace
-        run: mkdir -p /tmp/cursor-smoke
+          node-version: "24"
+      - name: Install runtime dependencies
+        run: npm ci --omit=dev --no-audit --no-fund
+      - name: Reach the Cursor API with an invalid key
+        shell: bash
+        env:
+          "INPUT_API-KEY": "invalid-key-used-to-probe-the-transport"
+          INPUT_PROMPT: "Say nothing."
+          INPUT_TIMEOUT: "60"
+          # Stay out of the checkout so this repo's own .cursor/ config and
+          # hooks cannot influence the run.
+          "INPUT_WORKING-DIRECTORY": ${{ runner.temp }}
+        run: |
+          set +e
+          OUTPUT="$(node dist/index.mjs 2>&1)"
+          set -e
+          echo "$OUTPUT"
+
+          if grep -qE "Cannot find module|ERR_MODULE_NOT_FOUND" <<<"$OUTPUT"; then
+            echo "::error::the action could not load its own dependencies"
+            exit 1
+          fi
+
+          if ! grep -q "Invalid User API Key" <<<"$OUTPUT"; then
+            echo "::error::expected the run to be rejected at authentication, got something else"
+            exit 1
+          fi
+
+          echo "Reached the Cursor API and was rejected at authentication, as expected."
+
+  # Spends a real agent run, so it needs a CURSOR_API_KEY on a paid plan and is
+  # never triggered automatically. Run it from the Actions tab before a release.
+  smoke-test:
+    name: Smoke Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs:
+      - build
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
       - name: Run cursor-action (smoke test)
         id: cursor
         uses: ./
         with:
           api-key: ${{ secrets.CURSOR_API_KEY }}
           prompt: "Say 'smoke test passed' and nothing else."
-          cursor-version: "latest"
-          model: ${{ env.CURSOR_SMOKE_TEST_MODEL }}
-          working-directory: "/tmp/cursor-smoke"
+          model: "default"
+          # Run outside the checkout so this repo's own .cursor/ config and
+          # hooks cannot influence the headless run.
+          working-directory: ${{ runner.temp }}
           permissions: "read-only"
           timeout: "60"
       - name: Assert output is non-empty
+        shell: bash
+        # Passed through env, never interpolated into the script: the summary is
+        # model output and would otherwise be executed as shell.
+        env:
+          SUMMARY: ${{ steps.cursor.outputs.summary }}
         run: |
-          SUMMARY="${{ steps.cursor.outputs.summary }}"
           if [ -z "$SUMMARY" ]; then
             echo "::error::cursor-action returned an empty summary"
             exit 1

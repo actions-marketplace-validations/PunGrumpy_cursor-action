@@ -2,8 +2,8 @@
 node_modules
 
 # output
+# `dist/` is committed on purpose: the action executes it straight from the tag.
 out
-dist
 *.tgz
 
 # code coverage
