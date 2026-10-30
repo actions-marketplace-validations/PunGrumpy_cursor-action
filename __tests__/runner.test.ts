@@ -15,6 +15,7 @@ mock.module("@actions/core", () => ({
 const mockAgentCreate = mock();
 const mockAgentSend = mock();
 const mockRunCancel = mock(() => Promise.resolve());
+const mockDispose = mock(() => Promise.resolve());
 
 mock.module("@cursor/sdk", () => ({
   Agent: {
@@ -33,32 +34,49 @@ const baseInputs: ActionInputs = {
   workingDirectory: ".",
 };
 
+const assistantEvent = (text: string) => ({
+  agent_id: "agent-test",
+  message: {
+    content: [{ text, type: "text" as const }],
+    role: "assistant" as const,
+  },
+  run_id: "run-test",
+  type: "assistant" as const,
+});
+
+const thinkingEvent = (text: string) => ({
+  agent_id: "agent-test",
+  run_id: "run-test",
+  text,
+  type: "thinking" as const,
+});
+
 const mockStreamSuccess = async function* mockStreamSuccess() {
-  yield { text: "Hello from stream chunk 1. " };
-  yield { text: "And chunk 2." };
+  yield assistantEvent("Hello from stream chunk 1. ");
+  yield assistantEvent("And chunk 2.");
 };
 
 const mockStreamError = async function* mockStreamError() {
-  yield { text: "Starting..." };
+  yield assistantEvent("Starting...");
   throw new Error("Stream aborted");
 };
 
 /**
  * Yields only after 1.1s so a 1s action timeout can fire first.
- * @yields {{ text: string }} The chunk that arrives too late.
+ * @yields {ReturnType<typeof assistantEvent>} The assistant event that arrives too late.
  */
 const streamAfter1100ms = async function* streamAfter1100ms() {
   await Bun.sleep(1100);
-  yield { text: "too late" };
+  yield assistantEvent("too late");
 };
 
 /**
  * Completes only after 1.2s when cancel is unsupported (timeout still scheduled).
- * @yields {{ text: string }} The chunk that arrives after the timeout.
+ * @yields {ReturnType<typeof assistantEvent>} The assistant event that arrives after the timeout.
  */
 const streamAfter1200ms = async function* streamAfter1200ms() {
   await Bun.sleep(1200);
-  yield { text: "ok" };
+  yield assistantEvent("ok");
 };
 
 const finishedWait = (result: string) => () =>
@@ -68,11 +86,22 @@ const finishedWait = (result: string) => () =>
     status: "finished" as const,
   });
 
+/** A promise that never settles, for runs that ignore cancellation. */
+const pending = <T = never>(): Promise<T> => Promise.withResolvers<T>().promise;
+
+const neverEndingStream = () => ({
+  [Symbol.asyncIterator]: () => ({
+    next: () => pending<IteratorResult<unknown>>(),
+  }),
+});
+
 describe("runAgent", () => {
   beforeEach(() => {
     mock.clearAllMocks();
+    mockDispose.mockImplementation(() => Promise.resolve());
 
     mockAgentCreate.mockResolvedValue({
+      [Symbol.asyncDispose]: mockDispose,
       send: mockAgentSend,
     });
 
@@ -91,19 +120,28 @@ describe("runAgent", () => {
       apiKey: "test-key",
       local: { cwd: expect.any(String) },
       model: { id: "default" },
+      tools: expect.arrayContaining(["read", "grep"]),
     });
 
     expect(mockAgentSend).toHaveBeenCalledWith("Analyze this code");
     expect(mockRunCancel).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
+    expect(result.status).toBe("finished");
     expect(result.stdout).toBe("Hello from stream chunk 1. And chunk 2.");
     expect(result.stderr).toBe("");
   });
 
-  it("warns when permissions is not read-only that the SDK does not use this input", async () => {
+  it("passes the permission level to Agent.create as tool restrictions", async () => {
     await runAgent({ ...baseInputs, permissions: "read-write" });
+    expect(mockAgentCreate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ disallowedTools: ["shell", "task"] })
+    );
 
-    expect(mockWarning).toHaveBeenCalledWith(
+    await runAgent({ ...baseInputs, permissions: "full" });
+    const fullCall = mockAgentCreate.mock.calls.at(-1)?.[0];
+    expect(fullCall).not.toHaveProperty("tools");
+    expect(fullCall).not.toHaveProperty("disallowedTools");
+    expect(mockWarning).not.toHaveBeenCalledWith(
       expect.stringContaining("permissions")
     );
   });
@@ -114,6 +152,7 @@ describe("runAgent", () => {
     const result = await runAgent(baseInputs);
 
     expect(result.exitCode).toBe(1);
+    expect(result.status).toBe("error");
     expect(result.stderr).toContain("Invalid API key");
     expect(mockWarning).toHaveBeenCalledWith(
       expect.stringContaining("Invalid API key")
@@ -126,12 +165,20 @@ describe("runAgent", () => {
       cancel: mockRunCancel,
       stream: streamAfter1100ms,
       supports: (op: string) => op === "cancel",
-      wait: finishedWait(""),
+      wait: () =>
+        Promise.resolve({
+          id: "run-test",
+          result: "",
+          status: "cancelled" as const,
+        }),
     });
 
-    await runAgent({ ...baseInputs, timeout: 1 });
+    const result = await runAgent({ ...baseInputs, timeout: 1 });
 
     expect(mockRunCancel).toHaveBeenCalled();
+    expect(result.exitCode).toBe(1);
+    expect(result.status).toBe("cancelled");
+    expect(result.stderr).toContain("timed out");
   }, 5000);
 
   it("does not call run.cancel when cancel is unsupported", async () => {
@@ -147,6 +194,7 @@ describe("runAgent", () => {
 
     expect(mockRunCancel).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
+    expect(result.status).toBe("finished");
   }, 5000);
 
   it("returns exitCode 1 when stream throws an error", async () => {
@@ -160,9 +208,154 @@ describe("runAgent", () => {
     const result = await runAgent(baseInputs);
 
     expect(result.exitCode).toBe(1);
+    expect(result.status).toBe("error");
     expect(result.stderr).toContain("Stream aborted");
     expect(mockWarning).toHaveBeenCalledWith(
       expect.stringContaining("Stream aborted")
+    );
+  });
+
+  it("returns exitCode 1 and surfaces error message when run.wait() finishes with error status", async () => {
+    mockAgentSend.mockResolvedValue({
+      cancel: mockRunCancel,
+      stream: mockStreamSuccess,
+      supports: (op: string) => op === "cancel",
+      wait: () =>
+        Promise.resolve({
+          error: { message: "Internal server error during turn" },
+          id: "run-test",
+          result: "",
+          status: "error" as const,
+        }),
+    });
+
+    const result = await runAgent(baseInputs);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.status).toBe("error");
+    expect(result.stderr).toContain("Internal server error during turn");
+    expect(mockWarning).toHaveBeenCalledWith(
+      expect.stringContaining("Internal server error during turn")
+    );
+  });
+
+  it("captures usage and duration from run.wait()", async () => {
+    mockAgentSend.mockResolvedValue({
+      cancel: mockRunCancel,
+      stream: mockStreamSuccess,
+      supports: (op: string) => op === "cancel",
+      wait: () =>
+        Promise.resolve({
+          durationMs: 4200,
+          id: "run-test",
+          result: "Done analysis",
+          status: "finished" as const,
+          usage: {
+            cacheReadTokens: 10,
+            cacheWriteTokens: 5,
+            inputTokens: 100,
+            outputTokens: 50,
+            totalTokens: 150,
+          },
+        }),
+    });
+
+    const result = await runAgent(baseInputs);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.durationMs).toBe(4200);
+    expect(result.usage?.totalTokens).toBe(150);
+  });
+
+  it("collects only assistant text when the run is cancelled before a result exists", async () => {
+    const mixedStream = async function* mixedStream() {
+      yield thinkingEvent("Let me think about this.");
+      yield assistantEvent("Partial ");
+      yield {
+        agent_id: "agent-test",
+        run_id: "run-test",
+        text: "subagent chatter",
+        type: "task" as const,
+      };
+      yield assistantEvent("answer");
+    };
+    mockAgentSend.mockResolvedValue({
+      cancel: mockRunCancel,
+      stream: mixedStream,
+      supports: (op: string) => op === "cancel",
+      wait: () =>
+        Promise.resolve({ id: "run-test", status: "cancelled" as const }),
+    });
+
+    const result = await runAgent(baseInputs);
+
+    expect(result.stdout).toBe("Partial answer");
+    expect(result.status).toBe("cancelled");
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("prefers the final result text over the streamed text when the run finishes", async () => {
+    const partialStream = async function* partialStream() {
+      yield assistantEvent("streamed draft");
+    };
+    mockAgentSend.mockResolvedValue({
+      cancel: mockRunCancel,
+      stream: partialStream,
+      supports: (op: string) => op === "cancel",
+      wait: finishedWait("final answer"),
+    });
+
+    const result = await runAgent(baseInputs);
+
+    expect(result.stdout).toBe("final answer");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("stops waiting when the run ignores the cancel request", async () => {
+    mockAgentSend.mockResolvedValue({
+      cancel: mockRunCancel,
+      stream: neverEndingStream,
+      supports: (op: string) => op === "cancel",
+      wait: () => pending(),
+    });
+
+    const startedAt = Date.now();
+    const result = await runAgent(
+      { ...baseInputs, timeout: 1 },
+      { cancelGraceMs: 200, disposeTimeoutMs: 200 }
+    );
+
+    expect(Date.now() - startedAt).toBeLessThan(3000);
+    expect(mockRunCancel).toHaveBeenCalled();
+    expect(result.exitCode).toBe(1);
+    expect(result.status).toBe("cancelled");
+    expect(result.stderr).toContain("timed out");
+    expect(mockDispose).toHaveBeenCalledTimes(1);
+  }, 5000);
+
+  it("releases the agent after a successful run", async () => {
+    await runAgent(baseInputs);
+    expect(mockDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the agent when send throws", async () => {
+    mockAgentSend.mockRejectedValue(new Error("send exploded"));
+
+    const result = await runAgent(baseInputs);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("send exploded");
+    expect(mockDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns even when releasing the agent hangs", async () => {
+    mockDispose.mockImplementation(() => pending());
+
+    const result = await runAgent(baseInputs, { disposeTimeoutMs: 100 });
+
+    expect(result.exitCode).toBe(0);
+    expect(mockWarning).toHaveBeenCalledWith(
+      expect.stringContaining("did not release")
     );
   });
 });

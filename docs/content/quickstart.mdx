@@ -12,7 +12,7 @@ Add a repository secret named `CURSOR_API_KEY`, then use the action:
 ```yaml
 - name: Run Cursor Agent
   id: cursor
-  uses: PunGrumpy/cursor-action@v1
+  uses: PunGrumpy/cursor-action@v2
   with:
     api-key: ${{ secrets.CURSOR_API_KEY }}
     prompt: "Review this PR for security issues and summarize your findings."
@@ -25,11 +25,8 @@ Add a repository secret named `CURSOR_API_KEY`, then use the action:
 
 The action runs on `ubuntu-latest`, `windows-latest`, and `macos-latest`.
 
-## What it does not do yet
+## Permissions
 
-Two inputs are accepted but have no effect. They are documented on [Reference](/reference), and both are addressed in v2:
-
-- `permissions` does **not** restrict the agent. `read-only` will not stop it from editing files or running shell commands.
-- A run that times out or fails inside the agent still reports success.
+`permissions` defaults to `read-only`, which lets the agent read and search the checkout and fetch the web, but not edit files, run commands, or spawn subagents. See [Behaviour](/behaviour) for the full mapping.
 
 Read [Behaviour](/behaviour) before wiring this into anything that gates a merge.

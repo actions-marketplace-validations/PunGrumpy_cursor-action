@@ -1,7 +1,7 @@
 {
   "name": "@pungrumpy/cursor-action",
-  "version": "1.0.1",
-  "description": "GitHub Action to install Cursor CLI and run cursor-agent in CI",
+  "version": "2.0.0",
+  "description": "Run cursor-agent in CI pipelines using the official @cursor/sdk",
   "keywords": [
     "ai",
     "cli",
@@ -44,7 +44,7 @@
   },
   "dependencies": {
     "@actions/core": "^3.0.0",
-    "@cursor/sdk": "^1.0.28"
+    "@cursor/sdk": "^1.0.38"
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",

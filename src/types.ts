@@ -13,11 +13,27 @@ export interface ActionInputs {
 export interface ActionOutputs {
   summary: string;
   exitCode: number;
+  status: string;
+  durationMs?: number;
+  totalTokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+export interface TokenUsageStats {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
 }
 
 export interface AgentResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  status?: string;
+  durationMs?: number;
+  usage?: TokenUsageStats;
   diagnostics?: string;
 }
